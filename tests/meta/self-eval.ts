@@ -126,7 +126,7 @@ const REQUIRED_HELPERS = [
 
 // ─── Runner ─────────────────────────────────────────────────────────
 
-const ROOT = path.resolve(__dirname, "../..");
+const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Z]:)/, "$1")), "../..");
 
 function fileExists(relativePath: string): boolean {
   return fs.existsSync(path.join(ROOT, relativePath));
