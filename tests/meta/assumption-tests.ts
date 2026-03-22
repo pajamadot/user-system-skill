@@ -139,11 +139,24 @@ const assumptions: AssumptionTest[] = [
     assumption: "Removing the last owner is prevented",
     risk: "medium",
     test: async () => {
+      // Check that the trigger exists in schema
+      const fs = await import("fs");
+      const path = await import("path");
+      const triggerFile = path.resolve(__dirname, "../../schema/004_last_owner_protection.sql");
+      const exists = fs.existsSync(triggerFile);
+      if (!exists) {
+        return {
+          passed: false,
+          detail: "MISSING: schema/004_last_owner_protection.sql — no trigger to prevent removing last owner.",
+        };
+      }
+      const content = fs.readFileSync(triggerFile, "utf-8");
+      const hasTrigger = content.includes("trg_check_last_owner") && content.includes("check_last_owner");
       return {
-        passed: false,
-        detail:
-          "NOT IMPLEMENTED: No check prevents removing/demoting the last owner of an org. " +
-          "Add a pre-delete check: count owners, reject if count would reach 0.",
+        passed: hasTrigger,
+        detail: hasTrigger
+          ? "Trigger trg_check_last_owner defined in schema/004_last_owner_protection.sql"
+          : "Trigger file exists but does not define trg_check_last_owner",
       };
     },
   },
@@ -178,11 +191,30 @@ const assumptions: AssumptionTest[] = [
     assumption: "Deleted project slugs can be reused",
     risk: "low",
     test: async () => {
+      // Check that the schema uses a partial unique index
+      const fs = await import("fs");
+      const path = await import("path");
+      const schemaFile = path.resolve(__dirname, "../../schema/001_initial.sql");
+      const content = fs.readFileSync(schemaFile, "utf-8");
+      const hasPartialIndex = content.includes("WHERE deleted_at IS NULL");
+      const hasInlineUnique = content.includes("UNIQUE (org_id, slug)");
+      if (hasPartialIndex && !hasInlineUnique) {
+        return {
+          passed: true,
+          detail: "Schema uses partial unique index (WHERE deleted_at IS NULL) — soft-deleted slugs are reusable.",
+        };
+      }
+      if (hasInlineUnique) {
+        return {
+          passed: false,
+          detail: "Schema uses inline UNIQUE(org_id, slug) without partial index — soft-deleted slugs block reuse.",
+        };
+      }
       return {
-        passed: false,
-        detail:
-          "POTENTIAL ISSUE: UNIQUE(org_id, slug) constraint may block reuse of soft-deleted slugs. " +
-          "Fix: change to partial unique index: UNIQUE(org_id, slug) WHERE deleted_at IS NULL",
+        passed: hasPartialIndex,
+        detail: hasPartialIndex
+          ? "Partial unique index found."
+          : "No unique index on (org_id, slug) found at all.",
       };
     },
   },

@@ -185,7 +185,7 @@ function evaluateTestCoverage(): DimensionScore {
 
 function schemaContains(pattern: string): boolean {
   // Search across all SQL schema files
-  const schemaFiles = ["schema/001_initial.sql", "schema/002_rls_policies.sql", "schema/003_api_tokens.sql"];
+  const schemaFiles = ["schema/001_initial.sql", "schema/002_rls_policies.sql", "schema/003_api_tokens.sql", "schema/004_last_owner_protection.sql"];
   return schemaFiles.some((f) => fileContains(f, pattern));
 }
 

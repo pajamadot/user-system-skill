@@ -32,6 +32,8 @@ CREATE TABLE org_members (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   PRIMARY KEY (org_id, user_id)
 );
+-- For "list my orgs" queries (user_id is not the leading key in the PK)
+CREATE INDEX idx_org_members_user ON org_members(user_id);
 
 -- Projects (scoped to organizations)
 CREATE TABLE projects (
@@ -42,9 +44,10 @@ CREATE TABLE projects (
   description TEXT,
   deleted_at TIMESTAMPTZ,  -- soft delete
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMPTZ DEFAULT NOW(),
-  UNIQUE (org_id, slug)
+  updated_at TIMESTAMPTZ DEFAULT NOW()
 );
+-- Partial unique: allow reuse of slugs from soft-deleted projects
+CREATE UNIQUE INDEX idx_projects_org_slug ON projects(org_id, slug) WHERE deleted_at IS NULL;
 
 -- Project Members (fine-grained project-level access)
 CREATE TABLE project_members (
@@ -56,3 +59,5 @@ CREATE TABLE project_members (
   updated_at TIMESTAMPTZ DEFAULT NOW(),
   PRIMARY KEY (project_id, user_id)
 );
+-- For "list my projects" queries
+CREATE INDEX idx_project_members_user ON project_members(user_id);

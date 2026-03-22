@@ -1510,4 +1510,14 @@ Is this a public-facing CLI that end users install?
 - Existing user: invite link → sign-in → `organizationMembership.created` webhook fires → upsert local org_member
   Your invite-accept handler must check whether the invitee already has an account (by email) and branch accordingly.
 
+**Soft-deleted slug reuse:** The schema uses a partial unique index `WHERE deleted_at IS NULL` so that deleting a project frees up its slug for reuse. Without this, `UNIQUE(org_id, slug)` blocks recreation.
+
+**Last-owner protection:** Never allow removing or demoting the last owner of an org. Use a trigger (see `schema/004_last_owner_protection.sql`) or application-level check: `SELECT COUNT(*) FROM org_members WHERE org_id = ? AND role = 'owner'` — reject if count would reach 0.
+
+**MCP token chain — never forward the original JWT:** Each downstream service gets a purpose-built token with the minimum scopes it needs. The Clerk JWT stays between the browser and your API. The MCP token stays between the LLM and the MCP server. The file-worker token stays between the MCP server and the file worker.
+
+**CLI token storage permissions:** Write token files with mode `0o600` (owner read/write only). On macOS/Linux, use `~/.config/your-cli/auth.json`. On CI, use env vars only — never write to disk.
+
+**API key hashing:** Store only the SHA-256 hash of API keys in the database. Show the full key once at creation, never again. Use a `token_prefix` column (first 8 chars) for quick identification in lists/logs without exposing the key.
+
 **Clerk org ↔ local org sync:** If using Clerk Organizations, keep `clerk_org_id` in your local `organizations` table. On invitation accept, the webhook creates the local org membership. If managing orgs locally only (not via Clerk), leave `auth_provider_org_id` NULL and handle invitations yourself.

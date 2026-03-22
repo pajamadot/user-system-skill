@@ -1,0 +1,21 @@
+{
+  "name": "user-system-skill",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Skill for building multi-tenant user systems with automated E2E testing",
+  "scripts": {
+    "self-eval": "npx tsx tests/meta/self-eval.ts",
+    "assumption-test": "npx tsx tests/meta/assumption-tests.ts",
+    "eval": "npm run self-eval && npm run assumption-test",
+    "test:e2e": "npx playwright test --config tests/playwright.config.ts",
+    "test:e2e:headed": "npx playwright test --config tests/playwright.config.ts --headed",
+    "worker:dev": "cd email-receiver-worker && npx wrangler dev",
+    "worker:deploy": "cd email-receiver-worker && npx wrangler deploy"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.49.0",
+    "dotenv": "^16.4.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}
