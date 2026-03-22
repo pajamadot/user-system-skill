@@ -40,6 +40,14 @@ Test by asking:
 | Webhook failure/retry | Mentioned | No | No |
 | Token expiration mid-request | No | No | No |
 | Multi-device sessions | No | No | No |
+| **MCP token exchange** | **Yes** | **Yes** | **No (token chain depth)** |
+| **MCP tool-level permissions** | **Yes** | **Yes** | **No (unknown tool names)** |
+| **MCP audience validation** | **Yes** | **Yes** | **No** |
+| **CLI device code flow** | **Yes** | **Yes** | **Partial (pending/expired)** |
+| **CLI PKCE flow** | **Yes** | **No** | **No** |
+| **API token create/revoke** | **Yes** | **Yes** | **No (scope enforcement)** |
+| **Token storage (disk)** | **Yes** | **No** | **No (permissions check)** |
+| **Token refresh** | **Yes** | **Yes** | **No (expired refresh)** |
 
 **Action:** Each "No" is a candidate for the next evolution cycle.
 
@@ -57,6 +65,11 @@ Every architecture has hidden assumptions. Surface them and test them.
 | Org roles are static (3 levels) | Schema CHECK constraint | Customer needs custom roles | Plan for future: `permissions` JSONB column |
 | Project slug is unique per org | Schema UNIQUE | Deleted project blocks slug reuse | Test: delete project, recreate with same slug |
 | RLS policies don't kill performance | Optional in schema | Slow queries on large tables | Benchmark with 100K rows, RLS on vs off |
+| MCP token scoping prevents cross-project access | JWT `project_id` claim | Data leak across projects | E2E: mint token for project A, try to access project B |
+| MCP tool permissions map covers all tools | Manual `TOOL_PERMISSIONS` dict | Unknown tool → default deny? or allow? | Grep MCP server for registered tools, diff against permissions map |
+| CLI token file permissions are restrictive (0600) | Code sets mode 0o600 | Other users on machine can read token | Test: check file permissions after save |
+| Device code polling respects `interval` | CLI waits `interval` seconds | Auth provider rate-limits or blocks | Test: rapid-fire poll, expect `slow_down` error |
+| API tokens are hashed, never stored plaintext | Schema: `token_hash` column | Stolen DB = stolen tokens | Audit: grep codebase for raw token storage |
 
 **Action:** Pick the top 3 highest-risk assumptions and add tests or mitigations.
 
@@ -68,6 +81,9 @@ Every architecture has hidden assumptions. Surface them and test them.
 | Adding a new email backend | Implement full `EmailHelper` class | Implement 2 methods, rest are defaults |
 | Adding a new org role | ALTER TABLE + code change | Config-driven, no schema change |
 | Adding a new project role | ALTER TABLE + code change | Config-driven, no schema change |
+| Adding a new MCP tool | Add entry to TOOL_PERMISSIONS map | One-line addition |
+| Adding a CLI auth method | Implement full flow + UI | Plug into unified `getAuthToken()` |
+| Scoping a token to a new audience | Mint with `aud` claim | Just pass audience string |
 | Running tests against staging | Change env vars | One command: `npm run e2e:staging` |
 | Understanding what went wrong | Read test output | Screenshot + trace auto-attached on failure |
 

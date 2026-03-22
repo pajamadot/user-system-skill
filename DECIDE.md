@@ -130,3 +130,68 @@ Just shipped a feature using this skill?
         └── YES → Full review of META.md lenses A, B, C
                   Update evolution priorities
 ```
+
+---
+
+## Decision 6: MCP Server Auth Strategy
+
+```
+Does your MCP server run locally (stdio) or remotely (HTTP/SSE)?
+├── LOCAL (stdio)
+│   ├── Is the MCP server calling your backend API?
+│   │   ├── YES → Pass user's service token via env var
+│   │   │         (bearer_token_env_var in MCP config)
+│   │   │         Backend validates JWT audience = "mcp"
+│   │   └── NO → No auth needed (process-level isolation is sufficient)
+│   └──
+└── REMOTE (HTTP/SSE/WebSocket)
+    ├── Does the LLM act on behalf of a specific user?
+    │   ├── YES → User-delegated token chain:
+    │   │         Clerk JWT → exchange for MCP service token (short-lived, project-scoped)
+    │   │         → MCP server verifies token, extracts user context
+    │   │         → MCP calls downstream with further-scoped tokens
+    │   └── NO (system-level MCP, no user context)
+    │       └── Use a static API key with fixed scopes
+    │           (rotatable, stored as env secret)
+    └──
+
+Need tool-level permissions?
+├── YES → Define TOOL_PERMISSIONS map:
+│         tool_name → required scopes
+│         Check token scopes before each tool execution
+└── NO → Audience-only check is sufficient
+         (any valid MCP token can call any tool)
+```
+
+---
+
+## Decision 7: CLI / Agent Auth Strategy
+
+```
+Is this a public-facing CLI that end users install?
+├── YES
+│   ├── Users always have a local browser available?
+│   │   ├── YES → PKCE + localhost redirect
+│   │   │         (smoothest UX — browser opens, auto-redirects back)
+│   │   └── NO (SSH, containers, remote servers)
+│   │       └── Device code flow
+│   │           (user visits URL on any device, enters code)
+│   └──
+└── NO (internal tool, CI/CD, scripts, agents)
+    ├── Human runs it interactively?
+    │   ├── YES → Device code OR PKCE (either works)
+    │   └── NO (fully automated)
+    │       ├── Short-lived task?
+    │       │   ├── YES → API key via env var (YOUR_API_KEY=...)
+    │       │   └── NO (long-running agent)
+    │       │       └── API key + automatic refresh
+    │       │           Or: service account with pre-minted token
+    │       └──
+    └──
+
+How to store the CLI token?
+├── macOS → Keychain (via keytar or native API)
+├── Linux → Secret Service API or encrypted file (~/.config/your-cli/auth.json, mode 0600)
+├── Windows → Windows Credential Manager (via keytar)
+└── CI/CD → Environment variable (never written to disk)
+```

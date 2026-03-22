@@ -46,17 +46,27 @@ const LIFECYCLE_STAGES = [
   { stage: "rbac-enforcement", requiredInSkill: "RBAC", requiredTest: "rbac-enforcement" },
   { stage: "webhook-handling", requiredInSkill: "webhook", requiredTest: "webhook" },
   { stage: "token-exchange", requiredInSkill: "token.*exchange", requiredTest: "token-exchange" },
+  { stage: "mcp-auth", requiredInSkill: "MCP.*Auth", requiredTest: "mcp-auth" },
+  { stage: "mcp-tool-permissions", requiredInSkill: "TOOL_PERMISSIONS", requiredTest: "mcp-auth" },
+  { stage: "mcp-token-scoping", requiredInSkill: "project.scoped|project_id.*mcp", requiredTest: "mcp-auth" },
+  { stage: "cli-device-code", requiredInSkill: "device.*code|Device Code", requiredTest: "cli-oauth" },
+  { stage: "cli-pkce", requiredInSkill: "PKCE", requiredTest: "cli-oauth" },
+  { stage: "api-tokens", requiredInSkill: "API.*Key|Personal.*Token|api_tokens", requiredTest: "cli-oauth" },
+  { stage: "token-storage", requiredInSkill: "token.*stor|securely.*disk", requiredTest: "cli-oauth" },
+  { stage: "token-refresh", requiredInSkill: "refresh.*token|token.*refresh", requiredTest: "cli-oauth" },
 ] as const;
 
 // ─── Schema Checks ──────────────────────────────────────────────────
 
-const REQUIRED_TABLES = ["users", "organizations", "org_members", "projects", "project_members"];
+const REQUIRED_TABLES = ["users", "organizations", "org_members", "projects", "project_members", "api_tokens", "device_codes"];
 const REQUIRED_COLUMNS: Record<string, string[]> = {
   users: ["id", "auth_provider_id", "email", "display_name", "created_at"],
   organizations: ["id", "slug", "name", "owner_user_id", "created_at"],
   org_members: ["org_id", "user_id", "role"],
   projects: ["id", "org_id", "slug", "name", "deleted_at", "created_at"],
   project_members: ["project_id", "user_id", "role"],
+  api_tokens: ["id", "user_id", "token_hash", "scopes", "expires_at"],
+  device_codes: ["device_code", "user_code", "status", "expires_at"],
 };
 
 // ─── API Route Checks ───────────────────────────────────────────────
@@ -77,6 +87,9 @@ const REQUIRED_ROUTES = [
   { label: "PATCH /v1/projects/:id", pattern: "PATCH.*projects/" },
   { label: "DELETE /v1/projects/:id", pattern: "DELETE.*projects/" },
   { label: "POST /v1/projects/:id/members", pattern: "projects/.*members" },
+  { label: "POST /v1/mcp/tools/call", pattern: "mcp.*tool" },
+  { label: "POST /v1/auth/device/code", pattern: "device.*code" },
+  { label: "POST /v1/auth/tokens", pattern: "API.*token|api_token|Personal.*Token" },
 ];
 
 // ─── Test File Checks ───────────────────────────────────────────────
@@ -99,6 +112,8 @@ const IDEAL_TEST_FILES = [
   "webhook-handling.spec.ts",
   "token-exchange.spec.ts",
   "session-management.spec.ts",
+  "mcp-auth.spec.ts",
+  "cli-oauth.spec.ts",
 ];
 
 // ─── Helper Checks ──────────────────────────────────────────────────
@@ -168,11 +183,17 @@ function evaluateTestCoverage(): DimensionScore {
   };
 }
 
+function schemaContains(pattern: string): boolean {
+  // Search across all SQL schema files
+  const schemaFiles = ["schema/001_initial.sql", "schema/002_rls_policies.sql", "schema/003_api_tokens.sql"];
+  return schemaFiles.some((f) => fileContains(f, pattern));
+}
+
 function evaluateSchemaCompleteness(): DimensionScore {
   const checks: CheckResult[] = [];
 
   for (const table of REQUIRED_TABLES) {
-    const exists = fileContains("schema/001_initial.sql", `CREATE TABLE ${table}`);
+    const exists = schemaContains(`CREATE TABLE ${table}`);
     checks.push({
       name: `schema-table-${table}`,
       passed: exists,
@@ -182,7 +203,7 @@ function evaluateSchemaCompleteness(): DimensionScore {
 
   for (const [table, columns] of Object.entries(REQUIRED_COLUMNS)) {
     for (const col of columns) {
-      const exists = fileContains("schema/001_initial.sql", col);
+      const exists = schemaContains(col);
       checks.push({
         name: `schema-column-${table}.${col}`,
         passed: exists,

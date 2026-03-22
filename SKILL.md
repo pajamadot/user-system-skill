@@ -843,6 +843,652 @@ test.describe('RBAC Enforcement', () => {
 
 ---
 
+## Part H: MCP Server Authentication
+
+MCP (Model Context Protocol) servers expose tools that LLMs call on behalf of users. The core challenge: **the LLM is not the user** — it acts as a delegate. Your auth system must propagate user identity and permissions through the MCP layer without giving the LLM unbounded access.
+
+### The Problem
+
+```
+User (browser) → Frontend → LLM Agent → MCP Server → Your Backend API
+                                ↑
+                          Who is "the caller" here?
+                          What permissions does it have?
+```
+
+The LLM doesn't have its own identity. It acts on behalf of a user, within a specific project/org context. The MCP server needs to:
+1. Know **which user** the LLM is acting for
+2. Know **which project/org** the call is scoped to
+3. Enforce **tool-level permissions** (not all tools for all users)
+4. Use a token that **expires quickly** and has **narrow scope**
+
+### Auth Flow: User-Delegated MCP Tokens
+
+```
+1. User signs in → gets Clerk JWT (broad, long-lived)
+
+2. Frontend exchanges Clerk JWT for MCP service token:
+   POST /v1/auth/token
+   Authorization: Bearer <clerk_jwt>
+   Body: { "audience": "mcp", "scopes": ["tools:read", "tools:write"], "project_id": "..." }
+   Response: { "token": "<mcp_service_jwt>", "expires_at": "..." }
+
+3. Frontend passes MCP token to LLM agent context
+
+4. LLM calls MCP server with:
+   Authorization: Bearer <mcp_service_jwt>
+
+5. MCP server verifies token, extracts user_id + project_id + scopes
+
+6. MCP server calls backend API with same token (or mints a further-scoped token)
+```
+
+**Key principle: each hop narrows the scope.** The Clerk JWT can do anything the user can. The MCP token can only call tools within a specific project. A downstream file-worker token can only read/write files in that project.
+
+### MCP Service Token (JWT Claims)
+
+```json
+{
+  "sub": "user_abc123",
+  "tenant_id": "org_xyz789",
+  "project_id": "proj_456",
+  "aud": "mcp",
+  "scopes": ["tools:read", "tools:write", "files:read"],
+  "iss": "your-backend",
+  "iat": 1711100000,
+  "exp": 1711100900
+}
+```
+
+- **Short-lived**: 15 minutes max (MCP calls are transactional, not sessions)
+- **Project-scoped**: cannot access other projects even if user has access
+- **Scope-limited**: only the permissions the agent needs, not all user permissions
+
+### Tool-Level Permission Mapping
+
+Map each MCP tool to the minimum required permission:
+
+```typescript
+const TOOL_PERMISSIONS: Record<string, string[]> = {
+  // Read-only tools
+  'list_files':       ['files:read'],
+  'get_file':         ['files:read'],
+  'search':           ['project:read'],
+  'get_project_info': ['project:read'],
+
+  // Write tools
+  'create_file':      ['files:write'],
+  'update_file':      ['files:write'],
+  'delete_file':      ['files:write', 'files:delete'],
+
+  // Admin tools
+  'manage_members':   ['project:admin'],
+  'update_settings':  ['project:admin'],
+};
+
+function checkToolPermission(tool: string, tokenScopes: string[]): boolean {
+  const required = TOOL_PERMISSIONS[tool];
+  if (!required) return false; // Unknown tool = deny
+  return required.every(scope => tokenScopes.includes(scope));
+}
+```
+
+### MCP Server Middleware
+
+```typescript
+// mcp-server/src/auth.ts
+import jwt from 'jsonwebtoken';
+
+interface McpAuthContext {
+  userId: string;
+  tenantId: string;
+  projectId: string | null;
+  scopes: string[];
+}
+
+export function verifyMcpToken(token: string): McpAuthContext {
+  const payload = jwt.verify(token, process.env.JWT_PUBLIC_KEY!, {
+    algorithms: ['RS256'],
+    audience: 'mcp',
+    issuer: 'your-backend',
+  }) as any;
+
+  return {
+    userId: payload.sub,
+    tenantId: payload.tenant_id,
+    projectId: payload.project_id || null,
+    scopes: payload.scopes || [],
+  };
+}
+
+// In tool handler:
+async function handleToolCall(toolName: string, args: any, token: string) {
+  const auth = verifyMcpToken(token);
+
+  if (!checkToolPermission(toolName, auth.scopes)) {
+    throw new Error(`Permission denied: ${toolName} requires ${TOOL_PERMISSIONS[toolName]}`);
+  }
+
+  // Execute tool with user context
+  return await executeTool(toolName, args, {
+    userId: auth.userId,
+    tenantId: auth.tenantId,
+    projectId: auth.projectId,
+  });
+}
+```
+
+### MCP Transport Auth
+
+MCP supports multiple transports. Auth works differently for each:
+
+| Transport | Auth Mechanism | Notes |
+|-----------|---------------|-------|
+| **stdio** (local) | Env var with token | `bearer_token_env_var` in MCP config |
+| **SSE** (HTTP stream) | Bearer token in initial request | Set in `Authorization` header |
+| **WebSocket** | Token in connection handshake | Pass in query param or first message |
+| **Streamable HTTP** | Bearer per request | Standard `Authorization: Bearer` header |
+
+For remote MCP servers, always use HTTPS. For local stdio servers, the token in env is sufficient since the process is sandboxed.
+
+### Downstream Token Chain
+
+When an MCP tool needs to call another service (file storage, database, external API), it should exchange the MCP token for a further-scoped token:
+
+```
+MCP token (scopes: tools:read, tools:write, files:read)
+  ↓ exchange at /v1/auth/token
+File-worker token (scopes: files:read, audience: file-worker, project_id: proj_456)
+```
+
+Never pass the user's original Clerk JWT to downstream services. Each service gets the minimum token it needs.
+
+### Testing MCP Auth
+
+```typescript
+// Test: MCP tool call with valid token succeeds
+test('authenticated tool call succeeds', async () => {
+  const token = await mintTestMcpToken({
+    userId: 'test-user',
+    projectId: 'test-project',
+    scopes: ['tools:read', 'files:read'],
+  });
+
+  const res = await mcpClient.callTool('list_files', { path: '/' }, token);
+  expect(res.status).toBe(200);
+});
+
+// Test: MCP tool call without permission is denied
+test('tool call without required scope is denied', async () => {
+  const token = await mintTestMcpToken({
+    userId: 'test-user',
+    projectId: 'test-project',
+    scopes: ['tools:read'], // missing files:write
+  });
+
+  const res = await mcpClient.callTool('create_file', { path: '/test.txt' }, token);
+  expect(res.status).toBe(403);
+});
+
+// Test: MCP token for wrong project is denied
+test('tool call with wrong project scope is denied', async () => {
+  const token = await mintTestMcpToken({
+    userId: 'test-user',
+    projectId: 'other-project',
+    scopes: ['tools:read', 'files:read'],
+  });
+
+  const res = await mcpClient.callTool('list_files', { path: '/', projectId: 'test-project' }, token);
+  expect(res.status).toBe(403);
+});
+
+// Test: expired MCP token is rejected
+test('expired token is rejected', async () => {
+  const token = await mintTestMcpToken({
+    userId: 'test-user',
+    scopes: ['tools:read'],
+    expiresInSeconds: -1, // already expired
+  });
+
+  const res = await mcpClient.callTool('list_files', { path: '/' }, token);
+  expect(res.status).toBe(401);
+});
+```
+
+---
+
+## Part I: CLI OAuth
+
+Command-line tools and headless agents can't open a browser popup for OAuth. They need flows designed for devices without a browser, or where the user authenticates in a separate browser session.
+
+### The Problem
+
+```
+CLI tool running in terminal
+  → Needs to make authenticated API calls
+  → User can't click an OAuth consent screen inside the terminal
+  → Token must be stored securely on disk
+  → Token must refresh without user interaction
+```
+
+### Three CLI Auth Approaches
+
+| Approach | User Experience | Security | Complexity | Best For |
+|----------|:---:|:---:|:---:|---------|
+| **Device Code Flow** | User visits URL, enters code | High | Medium | Public CLIs, multi-platform |
+| **PKCE + Localhost Redirect** | Browser opens, auto-redirects back | High | Medium | Desktop CLIs with browser access |
+| **API Key / Personal Token** | User copies token from dashboard | Medium | Low | Scripts, CI/CD, headless |
+
+### Approach 1: Device Code Flow (RFC 8628)
+
+Best for CLIs that can't guarantee a local browser. Works on SSH sessions, remote servers, containers.
+
+```
+1. CLI requests device code:
+   POST /oauth/device/code
+   Body: { client_id: "cli-app", scope: "read write" }
+   Response: {
+     device_code: "ABCD-1234",
+     user_code: "FGHJ-5678",
+     verification_uri: "https://yourapp.com/device",
+     expires_in: 900,
+     interval: 5
+   }
+
+2. CLI shows user:
+   "Visit https://yourapp.com/device and enter code: FGHJ-5678"
+
+3. User opens URL in any browser, signs in, enters code
+
+4. CLI polls for token:
+   POST /oauth/token
+   Body: { grant_type: "device_code", device_code: "ABCD-1234", client_id: "cli-app" }
+   Response (pending): { error: "authorization_pending" }
+   Response (success): { access_token: "...", refresh_token: "...", expires_in: 3600 }
+
+5. CLI stores token and uses it for API calls
+```
+
+**Implementation:**
+
+```typescript
+// cli/src/auth/device-flow.ts
+
+interface DeviceCodeResponse {
+  device_code: string;
+  user_code: string;
+  verification_uri: string;
+  verification_uri_complete?: string; // URI with code pre-filled
+  expires_in: number;
+  interval: number;
+}
+
+interface TokenResponse {
+  access_token: string;
+  refresh_token?: string;
+  expires_in: number;
+  token_type: string;
+}
+
+export async function deviceCodeLogin(authBaseUrl: string, clientId: string): Promise<TokenResponse> {
+  // Step 1: Request device code
+  const codeRes = await fetch(`${authBaseUrl}/oauth/device/code`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ client_id: clientId, scope: 'read write' }),
+  });
+  const deviceCode: DeviceCodeResponse = await codeRes.json();
+
+  // Step 2: Show user instructions
+  console.log(`\nTo authenticate, visit:\n  ${deviceCode.verification_uri}\n`);
+  console.log(`And enter code: ${deviceCode.user_code}\n`);
+
+  // Try to open browser automatically (optional, best-effort)
+  if (deviceCode.verification_uri_complete) {
+    try {
+      const open = (await import('open')).default;
+      await open(deviceCode.verification_uri_complete);
+      console.log('Browser opened automatically. Waiting for authorization...\n');
+    } catch {
+      // Browser didn't open — user will do it manually
+    }
+  }
+
+  // Step 3: Poll for token
+  const deadline = Date.now() + deviceCode.expires_in * 1000;
+  const interval = (deviceCode.interval || 5) * 1000;
+
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, interval));
+
+    const tokenRes = await fetch(`${authBaseUrl}/oauth/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
+        device_code: deviceCode.device_code,
+        client_id: clientId,
+      }),
+    });
+
+    if (tokenRes.ok) {
+      return await tokenRes.json();
+    }
+
+    const error = await tokenRes.json();
+    if (error.error === 'authorization_pending') continue;
+    if (error.error === 'slow_down') {
+      await new Promise(r => setTimeout(r, 5000)); // back off
+      continue;
+    }
+    throw new Error(`Auth failed: ${error.error_description || error.error}`);
+  }
+
+  throw new Error('Device code expired. Please try again.');
+}
+```
+
+### Approach 2: PKCE + Localhost Redirect (RFC 7636)
+
+Best for desktop CLIs where the user has a local browser. Spins up a temporary local HTTP server to catch the OAuth redirect.
+
+```
+1. CLI generates PKCE code_verifier + code_challenge
+2. CLI starts temporary HTTP server on localhost:PORT
+3. CLI opens browser:
+   https://auth-provider.com/authorize?
+     client_id=cli-app&
+     redirect_uri=http://localhost:PORT/callback&
+     response_type=code&
+     code_challenge=...&
+     code_challenge_method=S256&
+     scope=read+write
+
+4. User signs in and consents in browser
+
+5. Auth provider redirects to localhost:PORT/callback?code=AUTH_CODE
+
+6. CLI catches the redirect, exchanges code for token:
+   POST /oauth/token
+   Body: { grant_type: authorization_code, code: AUTH_CODE, code_verifier: ... }
+
+7. CLI shuts down temporary server, stores token
+```
+
+**Implementation:**
+
+```typescript
+// cli/src/auth/pkce-flow.ts
+import http from 'http';
+import crypto from 'crypto';
+
+function generatePKCE() {
+  const verifier = crypto.randomBytes(32).toString('base64url');
+  const challenge = crypto.createHash('sha256').update(verifier).digest('base64url');
+  return { verifier, challenge };
+}
+
+export async function pkceLogin(
+  authorizeUrl: string,
+  tokenUrl: string,
+  clientId: string,
+): Promise<TokenResponse> {
+  const { verifier, challenge } = generatePKCE();
+  const port = await findFreePort(); // Find an available port
+  const redirectUri = `http://localhost:${port}/callback`;
+
+  return new Promise((resolve, reject) => {
+    const server = http.createServer(async (req, res) => {
+      const url = new URL(req.url!, `http://localhost:${port}`);
+      if (url.pathname !== '/callback') return;
+
+      const code = url.searchParams.get('code');
+      const error = url.searchParams.get('error');
+
+      if (error) {
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end('<h1>Authentication failed</h1><p>You can close this tab.</p>');
+        server.close();
+        reject(new Error(`Auth error: ${error}`));
+        return;
+      }
+
+      // Exchange code for token
+      const tokenRes = await fetch(tokenUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          grant_type: 'authorization_code',
+          code,
+          code_verifier: verifier,
+          redirect_uri: redirectUri,
+          client_id: clientId,
+        }),
+      });
+
+      const token: TokenResponse = await tokenRes.json();
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.end('<h1>Authenticated!</h1><p>You can close this tab and return to the CLI.</p>');
+      server.close();
+      resolve(token);
+    });
+
+    server.listen(port, () => {
+      const authUrl = `${authorizeUrl}?` + new URLSearchParams({
+        client_id: clientId,
+        redirect_uri: redirectUri,
+        response_type: 'code',
+        code_challenge: challenge,
+        code_challenge_method: 'S256',
+        scope: 'read write',
+      }).toString();
+
+      console.log(`Opening browser for authentication...`);
+      import('open').then(m => m.default(authUrl)).catch(() => {
+        console.log(`Open this URL in your browser:\n  ${authUrl}\n`);
+      });
+    });
+
+    // Timeout after 5 minutes
+    setTimeout(() => { server.close(); reject(new Error('Auth timed out')); }, 300_000);
+  });
+}
+```
+
+### Approach 3: API Keys / Personal Access Tokens
+
+Simplest approach. User creates a token in the web dashboard, pastes it into the CLI.
+
+```typescript
+// cli/src/auth/api-key.ts
+export async function apiKeyLogin(): Promise<string> {
+  const readline = await import('readline');
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+
+  return new Promise(resolve => {
+    rl.question('Paste your API key (from dashboard → Settings → API Keys):\n> ', (key) => {
+      rl.close();
+      resolve(key.trim());
+    });
+  });
+}
+```
+
+Store API keys as long-lived tokens in the database:
+
+```sql
+CREATE TABLE api_tokens (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  org_id TEXT REFERENCES organizations(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,           -- "My CLI token"
+  token_hash TEXT NOT NULL,     -- SHA-256 of the token (never store plaintext)
+  scopes TEXT[] NOT NULL,       -- ['read', 'write']
+  last_used_at TIMESTAMPTZ,
+  expires_at TIMESTAMPTZ,       -- NULL = never expires
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+```
+
+### Token Storage
+
+CLI tokens must be stored securely on disk. Never in plaintext config files.
+
+```typescript
+// cli/src/auth/token-store.ts
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
+
+interface StoredAuth {
+  access_token: string;
+  refresh_token?: string;
+  expires_at: number; // Unix timestamp
+}
+
+const TOKEN_DIR = path.join(os.homedir(), '.config', 'your-cli');
+const TOKEN_FILE = path.join(TOKEN_DIR, 'auth.json');
+
+export function saveToken(auth: StoredAuth): void {
+  fs.mkdirSync(TOKEN_DIR, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(TOKEN_FILE, JSON.stringify(auth), { mode: 0o600 });
+}
+
+export function loadToken(): StoredAuth | null {
+  try {
+    const data = fs.readFileSync(TOKEN_FILE, 'utf-8');
+    return JSON.parse(data);
+  } catch {
+    return null;
+  }
+}
+
+export function clearToken(): void {
+  try { fs.unlinkSync(TOKEN_FILE); } catch {}
+}
+
+export function isTokenExpired(auth: StoredAuth): boolean {
+  // Refresh 5 minutes before expiry
+  return Date.now() > (auth.expires_at - 300) * 1000;
+}
+```
+
+### Token Refresh
+
+```typescript
+// cli/src/auth/refresh.ts
+export async function refreshAccessToken(
+  tokenUrl: string,
+  clientId: string,
+  refreshToken: string,
+): Promise<TokenResponse> {
+  const res = await fetch(tokenUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      grant_type: 'refresh_token',
+      refresh_token: refreshToken,
+      client_id: clientId,
+    }),
+  });
+
+  if (!res.ok) {
+    throw new Error('Refresh failed — please sign in again: yourctl auth login');
+  }
+  return res.json();
+}
+```
+
+### Unified CLI Auth (Putting It Together)
+
+```typescript
+// cli/src/auth/index.ts
+export async function getAuthToken(): Promise<string> {
+  // 1. Check for stored token
+  const stored = loadToken();
+  if (stored && !isTokenExpired(stored)) {
+    return stored.access_token;
+  }
+
+  // 2. Try refresh
+  if (stored?.refresh_token) {
+    try {
+      const refreshed = await refreshAccessToken(TOKEN_URL, CLIENT_ID, stored.refresh_token);
+      saveToken({
+        access_token: refreshed.access_token,
+        refresh_token: refreshed.refresh_token || stored.refresh_token,
+        expires_at: Math.floor(Date.now() / 1000) + refreshed.expires_in,
+      });
+      return refreshed.access_token;
+    } catch {
+      // Refresh failed — fall through to re-auth
+    }
+  }
+
+  // 3. Check for API key in env (CI/CD use case)
+  if (process.env.YOUR_API_KEY) {
+    return process.env.YOUR_API_KEY;
+  }
+
+  // 4. Interactive login required
+  throw new Error('Not authenticated. Run: yourctl auth login');
+}
+```
+
+### CLI Auth with Clerk
+
+Clerk doesn't natively support device code flow, but you can implement it using Clerk's Backend API:
+
+```typescript
+// Backend: POST /v1/auth/device/code
+async function createDeviceCode(clientId: string) {
+  const code = crypto.randomBytes(4).toString('hex').toUpperCase(); // e.g., "A1B2-C3D4"
+  const deviceCode = crypto.randomBytes(32).toString('hex');
+
+  // Store in Redis/DB with TTL
+  await redis.setex(`device:${deviceCode}`, 900, JSON.stringify({
+    user_code: code,
+    client_id: clientId,
+    status: 'pending',  // pending → approved → used
+    user_id: null,
+  }));
+
+  return {
+    device_code: deviceCode,
+    user_code: code,
+    verification_uri: `${APP_URL}/device`,
+    expires_in: 900,
+    interval: 5,
+  };
+}
+
+// Frontend: /device page
+// User signs in with Clerk, enters code, page calls:
+// POST /v1/auth/device/approve { user_code: "A1B2-C3D4" }
+// Backend sets status → approved, stores user_id from Clerk session
+
+// Backend: POST /v1/auth/device/token
+// CLI polls this. When status is approved, mint a service JWT for the CLI.
+```
+
+### Comparison: When to Use Which
+
+```
+Is this a public-facing CLI that end users install?
+├── YES
+│   ├── Users will always have a local browser?
+│   │   ├── YES → PKCE + localhost redirect (smoothest UX)
+│   │   └── NO  → Device code flow (works over SSH, in containers)
+│   └──
+└── NO (internal tool, scripts, CI/CD)
+    ├── Interactive (human runs it)?
+    │   ├── YES → PKCE or device code
+    │   └── NO  → API key via env var (YOUR_API_KEY=...)
+    └──
+```
+
+---
+
 ## Part G: Gotchas & Patterns
 
 **Email normalization:** Always `email.trim().toLowerCase()` before comparison or storage.
