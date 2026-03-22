@@ -17,7 +17,8 @@ export async function runMigrations() {
   const fs = await import("fs");
   const path = await import("path");
 
-  const schemaDir = path.resolve(__dirname, "../../schema");
+  const thisDir = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Z]:)/, "$1"));
+  const schemaDir = path.resolve(thisDir, "../../schema");
   const files = fs.readdirSync(schemaDir).filter((f: string) => f.endsWith(".sql")).sort();
 
   for (const file of files) {

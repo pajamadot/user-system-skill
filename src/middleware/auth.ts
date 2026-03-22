@@ -1,6 +1,5 @@
 import { createMiddleware } from "hono/factory";
-import type { Context } from "hono";
-import { verifyClerkJWT } from "../services/auth";
+import { verifyClerkJWT, verifyTestJWT } from "../services/auth";
 import { validateApiToken } from "../db/tokens";
 import * as usersDb from "../db/users";
 import * as orgsDb from "../db/orgs";
@@ -13,11 +12,20 @@ export type Env = {
   };
 };
 
+const IS_TEST = process.env.NODE_ENV === "test";
+
 /**
- * Auth middleware: verifies Bearer token (Clerk JWT or API key),
+ * Auth middleware: verifies Bearer token (Clerk JWT, test JWT, or API key),
  * auto-syncs user to local DB, attaches user context.
+ *
+ * In test mode (NODE_ENV=test), accepts JWTs signed with TEST_JWT_SECRET.
  */
 export const authMiddleware = createMiddleware<Env>(async (c, next) => {
+  // Skip auth for public device code endpoints
+  if (c.req.path.includes("/device/code") || c.req.path.includes("/device/token")) {
+    return next();
+  }
+
   const authHeader = c.req.header("Authorization");
   if (!authHeader?.startsWith("Bearer ")) {
     return c.json({ error: "Missing or invalid Authorization header" }, 401);
@@ -42,6 +50,22 @@ export const authMiddleware = createMiddleware<Env>(async (c, next) => {
     return next();
   }
 
+  // In test mode, accept test JWTs signed with HMAC secret
+  if (IS_TEST) {
+    try {
+      const claims = verifyTestJWT(token);
+      const currentUser = await ensureLocalUser({
+        authProviderId: claims.sub,
+        email: claims.email || claims.sub,
+        displayName: claims.name || null,
+      });
+      c.set("user", currentUser);
+      return next();
+    } catch {
+      // Fall through to Clerk verification
+    }
+  }
+
   // Otherwise, verify as Clerk JWT
   try {
     const claims = await verifyClerkJWT(token);
@@ -60,7 +84,6 @@ export const authMiddleware = createMiddleware<Env>(async (c, next) => {
 
 /**
  * Auto-sync: ensure auth provider user exists locally.
- * Handles: first login, email-based linking, new user creation.
  */
 async function ensureLocalUser(data: {
   authProviderId: string;

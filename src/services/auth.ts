@@ -85,6 +85,22 @@ export function mintServiceJWT(data: {
 }
 
 export function verifyServiceJWT(token: string, expectedAudience?: string): ServiceTokenPayload {
+  // In test mode, accept HMAC-signed service JWTs too
+  const isTest = process.env.NODE_ENV === "test";
+  const testSecret = process.env.TEST_JWT_SECRET || "test-secret-do-not-use-in-production";
+
+  if (isTest) {
+    try {
+      const payload = jwt.verify(token, testSecret, {
+        algorithms: ["HS256"],
+        ...(expectedAudience && { audience: expectedAudience }),
+      }) as ServiceTokenPayload;
+      return payload;
+    } catch {
+      // Fall through to RS256
+    }
+  }
+
   if (!JWT_PUBLIC_KEY) throw new Error("JWT_PUBLIC_KEY not configured");
 
   const payload = jwt.verify(token, JWT_PUBLIC_KEY, {
@@ -93,4 +109,42 @@ export function verifyServiceJWT(token: string, expectedAudience?: string): Serv
   }) as ServiceTokenPayload;
 
   return payload;
+}
+
+// ─── Test JWT (HMAC, for integration tests without Clerk) ───────────
+
+const TEST_JWT_SECRET = process.env.TEST_JWT_SECRET || "test-secret-do-not-use-in-production";
+
+export function mintTestJWT(data: { sub: string; email: string; name?: string }): string {
+  return jwt.sign(
+    { sub: data.sub, email: data.email, name: data.name || null, iss: "test" },
+    TEST_JWT_SECRET,
+    { algorithm: "HS256", expiresIn: "1h" },
+  );
+}
+
+export function verifyTestJWT(token: string): { sub: string; email: string; name?: string } {
+  return jwt.verify(token, TEST_JWT_SECRET, { algorithms: ["HS256"] }) as any;
+}
+
+export function mintTestServiceJWT(data: {
+  sub: string;
+  tenantId: string;
+  audience: string;
+  scopes: string[];
+  projectId?: string;
+  expiresIn?: number;
+}): string {
+  return jwt.sign(
+    {
+      sub: data.sub,
+      tenant_id: data.tenantId,
+      aud: data.audience,
+      scopes: data.scopes,
+      iss: "user-system",
+      ...(data.projectId && { project_id: data.projectId }),
+    },
+    TEST_JWT_SECRET,
+    { algorithm: "HS256", expiresIn: data.expiresIn || 900 },
+  );
 }

@@ -29,19 +29,12 @@ app.get("/health", (c) => c.json({ status: "ok", timestamp: new Date().toISOStri
 
 app.route("/api/webhooks", webhookRoutes);
 
-// Device code endpoints (code request + token polling are public)
-const devicePublic = new Hono();
-devicePublic.post("/device/code", async (c) => {
-  const authModule = await import("./routes/auth");
-  // Forward to the auth route handler
-  return authModule.default.fetch(c.req.raw, c.env);
-});
-devicePublic.post("/device/token", async (c) => {
-  const authModule = await import("./routes/auth");
-  return authModule.default.fetch(c.req.raw, c.env);
-});
+// MCP routes use their own auth (service JWT, not Clerk JWT)
+app.route("/v1/mcp", mcpRoutes);
 
 // ─── Authenticated Routes ───────────────────────────────────────────
+// Auth middleware skips device/code and device/token paths (public).
+// All other /v1/* routes require a valid Bearer token.
 
 const api = new Hono<Env>();
 api.use("*", authMiddleware);
@@ -52,59 +45,6 @@ api.route("/projects", projectRoutes);
 
 app.route("/v1", api);
 
-// MCP routes use their own auth (service JWT, not Clerk)
-app.route("/v1/mcp", mcpRoutes);
-
-// Re-mount device code public endpoints under /v1/auth
-app.post("/v1/auth/device/code", async (c) => {
-  const body = await c.req.json();
-  const { createDeviceCode } = await import("./db/tokens");
-  const scopes = body.scope?.split(" ") || ["read"];
-  const dc = await createDeviceCode(body.client_id || "unknown", scopes);
-  return c.json({
-    device_code: dc.device_code,
-    user_code: dc.user_code,
-    verification_uri: `${process.env.APP_URL || "http://localhost:3000"}/device`,
-    verification_uri_complete: `${process.env.APP_URL || "http://localhost:3000"}/device?code=${dc.user_code}`,
-    expires_in: 900,
-    interval: 5,
-  });
-});
-
-app.post("/v1/auth/device/token", async (c) => {
-  const body = await c.req.json();
-  const { getDeviceCode, markDeviceCodeUsed, createApiToken } = await import("./db/tokens");
-
-  const dc = await getDeviceCode(body.device_code);
-  if (!dc || dc.client_id !== body.client_id) {
-    return c.json({ error: "invalid_grant", error_description: "Invalid device code" }, 400);
-  }
-  if (dc.expires_at < new Date()) {
-    return c.json({ error: "expired_token", error_description: "Device code expired" }, 400);
-  }
-  if (dc.status === "pending") {
-    return c.json({ error: "authorization_pending" }, 400);
-  }
-  if (dc.status === "used") {
-    return c.json({ error: "invalid_grant", error_description: "Code already used" }, 400);
-  }
-  if (dc.status === "approved" && dc.user_id) {
-    await markDeviceCodeUsed(body.device_code);
-    const { row, plainToken } = await createApiToken({
-      userId: dc.user_id,
-      name: `CLI (${dc.client_id})`,
-      scopes: dc.scopes,
-    });
-    return c.json({
-      access_token: plainToken,
-      token_type: "Bearer",
-      expires_in: row.expires_at ? Math.floor((row.expires_at.getTime() - Date.now()) / 1000) : null,
-      scope: dc.scopes.join(" "),
-    });
-  }
-  return c.json({ error: "server_error" }, 500);
-});
-
 // ─── Start Server ───────────────────────────────────────────────────
 
 const port = parseInt(process.env.PORT || "8080", 10);
@@ -114,7 +54,6 @@ export default {
   fetch: app.fetch,
 };
 
-// For Node.js (non-Bun) environments
 if (!(globalThis as any).Bun) {
   import("@hono/node-server").then(({ serve }) => {
     serve({ fetch: app.fetch, port });
