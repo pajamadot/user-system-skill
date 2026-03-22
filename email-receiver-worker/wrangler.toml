@@ -1,0 +1,19 @@
+name = "email-receiver"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+
+# Email routing — receives emails forwarded by Cloudflare catch-all rule
+[triggers]
+# Uncomment after enabling email routing in Cloudflare Dashboard:
+# emails = ["*@test.yourdomain.com"]
+
+# KV namespace for storing received emails (1h TTL)
+[[kv_namespaces]]
+binding = "TEST_EMAILS"
+id = "YOUR_KV_NAMESPACE_ID"
+# Run: npx wrangler kv namespace create TEST_EMAILS
+# Then paste the id here
+
+[vars]
+# Set via `wrangler secret put AUTH_TOKEN`
+# AUTH_TOKEN = "your-secret-token"
