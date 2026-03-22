@@ -859,4 +859,9 @@ test.describe('RBAC Enforcement', () => {
 
 **Rate limits:** Clerk rate-limits user creation to ~20/second. In CI with parallel tests, use a pool of pre-created test users or serialize user creation.
 
+**Invite acceptance by existing users:** When an existing user accepts an org invitation, the flow differs from a new user: they don't need to sign up — they sign in, then the invitation is auto-accepted. Handle both paths:
+- New user: invite link → sign-up → auto-join org on account creation
+- Existing user: invite link → sign-in → `organizationMembership.created` webhook fires → upsert local org_member
+  Your invite-accept handler must check whether the invitee already has an account (by email) and branch accordingly.
+
 **Clerk org ↔ local org sync:** If using Clerk Organizations, keep `clerk_org_id` in your local `organizations` table. On invitation accept, the webhook creates the local org membership. If managing orgs locally only (not via Clerk), leave `auth_provider_org_id` NULL and handle invitations yourself.
